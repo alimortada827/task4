@@ -1,0 +1,196 @@
+pip install Flask Flask-SocketIO Flask-SQLAlchemy Flask-Login Flask-WTF
+
+
+import os
+
+class Config:
+    SECRET_KEY = os.urandom(24)
+    SQLALCHEMY_DATABASE_URI = 'sqlite:///chat.db'
+    SQLALCHEMY_TRACK_MODIFICATIONS = False
+
+
+from flask_sqlalchemy import SQLAlchemy
+from flask_login import UserMixin
+from datetime import datetime
+
+db = SQLAlchemy()
+
+class User(db.Model, UserMixin):
+    id = db.Column(db.Integer, primary_key=True)
+    username = db.Column(db.String(150), nullable=False, unique=True)
+    email = db.Column(db.String(150), nullable=False, unique=True)
+    password = db.Column(db.String(200), nullable=False)
+    online = db.Column(db.Boolean, default=False)
+
+class Message(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    room = db.Column(db.String(100), nullable=False)
+    sender_id = db.Column(db.Integer, db.ForeignKey('user.id'))
+    content = db.Column(db.Text, nullable=False)
+    timestamp = db.Column(db.DateTime, default=datetime.utcnow)
+
+    sender = db.relationship('User', backref='messages', lazy=True)
+
+class ChatRoom(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    name = db.Column(db.String(100), nullable=False, unique=True)
+
+
+
+from flask import Flask
+from models import db
+from config import Config
+from flask_socketio import SocketIO
+
+app = Flask(__name__)
+app.config.from_object(Config)
+
+db.init_app(app)
+socketio = SocketIO(app)
+
+from routes import *
+
+if __name__ == '__main__':
+    with app.app_context():
+        db.create_all()
+    socketio.run(app, debug=True)
+
+
+from flask import render_template, redirect, url_for, flash, request, session
+from models import User, Message, ChatRoom, db
+from flask_login import login_user, logout_user, current_user, login_required
+from app import app, socketio
+from forms import RegistrationForm, LoginForm
+from flask_socketio import send, join_room, leave_room
+
+# User registration
+@app.route('/register', methods=['GET', 'POST'])
+def register():
+    form = RegistrationForm()
+    if form.validate_on_submit():
+        user = User(username=form.username.data, email=form.email.data, password=form.password.data)
+        db.session.add(user)
+        db.session.commit()
+        flash('Account created successfully! Please log in.', 'success')
+        return redirect(url_for('login'))
+    return render_template('register.html', form=form)
+
+# User login
+@app.route('/login', methods=['GET', 'POST'])
+def login():
+    form = LoginForm()
+    if form.validate_on_submit():
+        user = User.query.filter_by(email=form.email.data).first()
+        if user and user.password == form.password.data:
+            login_user(user)
+            return redirect(url_for('chatroom'))
+        else:
+            flash('Login unsuccessful. Please check email and password.', 'danger')
+    return render_template('login.html', form=form)
+
+# Chatroom view
+@app.route('/chatroom')
+@login_required
+def chatroom():
+    rooms = ChatRoom.query.all()
+    return render_template('chatroom.html', username=current_user.username, rooms=rooms)
+
+# WebSocket Handlers
+@socketio.on('message')
+def handle_message(data):
+    room = data['room']
+    message = Message(room=room, sender_id=current_user.id, content=data['message'])
+    db.session.add(message)
+    db.session.commit()
+    send({'msg': data['message'], 'username': current_user.username}, room=room)
+
+@socketio.on('join')
+def on_join(data):
+    room = data['room']
+    join_room(room)
+    send({'msg': f'{current_user.username} has joined the room.'}, room=room)
+
+@socketio.on('leave')
+def on_leave(data):
+    room = data['room']
+    leave_room(room)
+    send({'msg': f'{current_user.username} has left the room.'}, room=room)
+
+# Private messaging
+@app.route('/private_chat/<int:user_id>')
+@login_required
+def private_chat(user_id):
+    recipient = User.query.get_or_404(user_id)
+    return render_template('private_chat.html', recipient=recipient)
+
+@socketio.on('private_message')
+def handle_private_message(data):
+    recipient_id = data['recipient_id']
+    message = Message(room='private', sender_id=current_user.id, content=data['message'])
+    db.session.add(message)
+    db.session.commit()
+    send({'msg': data['message'], 'username': current_user.username}, room=f'private_{recipient_id}')
+
+
+from flask_wtf import FlaskForm
+from wtforms import StringField, PasswordField, SubmitField
+from wtforms.validators import DataRequired, Email, Length
+
+class RegistrationForm(FlaskForm):
+    username = StringField('Username', validators=[DataRequired(), Length(min=2, max=20)])
+    email = StringField('Email', validators=[DataRequired(), Email()])
+    password = PasswordField('Password', validators=[DataRequired()])
+    submit = SubmitField('Register')
+
+class LoginForm(FlaskForm):
+    email = StringField('Email', validators=[DataRequired(), Email()])
+    password = PasswordField('Password', validators=[DataRequired()])
+    submit = SubmitField('Login')
+
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>Chat Room</title>
+</head>
+<body>
+    <h1>Welcome, {{ username }}!</h1>
+    <ul>
+        {% for room in rooms %}
+            <li>
+                <a href="#" onclick="joinRoom('{{ room.name }}')">{{ room.name }}</a>
+            </li>
+        {% endfor %}
+    </ul>
+
+    <div id="chat">
+        <ul id="messages"></ul>
+        <input id="message" type="text">
+        <button onclick="sendMessage()">Send</button>
+    </div>
+
+    <script src="//cdnjs.cloudflare.com/ajax/libs/socket.io/4.0.0/socket.io.js"></script>
+    <script>
+        var socket = io();
+
+        function joinRoom(room) {
+            socket.emit('join', {'room': room});
+            document.getElementById('messages').innerHTML = '';
+        }
+
+        socket.on('message', function(data) {
+            var msg = document.createElement('li');
+            msg.innerHTML = data.username + ": " + data.msg;
+            document.getElementById('messages').appendChild(msg);
+        });
+
+        function sendMessage() {
+            var msg = document.getElementById('message').value;
+            socket.emit('message', {'room': 'general', 'message': msg});
+            document.getElementById('message').value = '';
+        }
+    </script>
+</body>
+</html>
+
+
